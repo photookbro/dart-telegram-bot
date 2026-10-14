@@ -1,6 +1,10 @@
-"""오늘 공시 중 감시 종목만 텔레그램으로 보낸다."""
+"""오늘 공시 중 감시 종목만 텔레그램으로 보낸다.
+
+이미 보낸 접수번호는 sent_rcept_no.txt에 적혀 있으면 다시 보내지 않는다.
+"""
 
 import os
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -9,7 +13,9 @@ from dart_client import DartError, fetch_today, today_yyyymmdd
 from main import ENV_PATH, load_dotenv
 
 WATCHLIST_PATH = Path(__file__).resolve().parent / "watchlist.txt"
+SENT_PATH = Path(__file__).resolve().parent / "sent_rcept_no.txt"
 TIMEOUT_SECONDS = 15
+KEEP_DAYS = 7
 
 
 class TelegramError(Exception):
@@ -31,11 +37,49 @@ def load_watchlist(path: Path) -> set[str]:
     return codes
 
 
+def format_received_date(yyyymmdd: str) -> str:
+    """YYYYMMDD를 YYYY-MM-DD로 바꾼다."""
+    return f"{yyyymmdd[0:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+
 def build_message(corp_name: str, report_nm: str, rcept_no: str, yyyymmdd: str) -> str:
     """텔레그램에 보낼 공시 한 건 문구를 만든다."""
-    received = f"{yyyymmdd[0:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
     link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
-    return f"[{corp_name}] {report_nm}\n접수일: {received}\n원문: {link}"
+    return (
+        f"[{corp_name}] {report_nm}\n"
+        f"접수일: {format_received_date(yyyymmdd)}\n"
+        f"원문: {link}"
+    )
+
+
+def load_sent(path: Path, today: date) -> list[tuple[str, str]]:
+    """보낸 접수번호를 읽는다. 7일보다 오래된 줄은 버린다. 파일이 없으면 빈 목록."""
+    if not path.is_file():
+        return []
+
+    cutoff = today - timedelta(days=KEEP_DAYS)
+    kept: list[tuple[str, str]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or "," not in line:
+            continue
+        rcept_no, received = line.split(",", 1)
+        rcept_no = rcept_no.strip()
+        received = received.strip()
+        try:
+            received_date = datetime.strptime(received, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if not rcept_no or received_date < cutoff:
+            continue
+        kept.append((rcept_no, received))
+    return kept
+
+
+def save_sent(path: Path, rows: list[tuple[str, str]]) -> None:
+    """접수번호,접수일 형식으로 저장한다. 파일이 없으면 새로 만든다."""
+    body = "".join(f"{rcept_no},{received}\n" for rcept_no, received in rows)
+    path.write_text(body, encoding="utf-8")
 
 
 def send_telegram(token: str, chat_id: str, text: str) -> None:
@@ -96,9 +140,15 @@ def main() -> None:
         print(".env에 값을 넣은 뒤 다시 실행하세요.")
         raise SystemExit(1)
 
+    received_on = today_yyyymmdd()
+    today = datetime.strptime(received_on, "%Y%m%d").date()
+    sent_rows = load_sent(SENT_PATH, today)
+    sent_ids = {rcept_no for rcept_no, _received in sent_rows}
+    save_sent(SENT_PATH, sent_rows)
+
     watchlist = load_watchlist(WATCHLIST_PATH)
     if not watchlist:
-        print("감시 종목 공시 없음")
+        print("새 공시 0건 전송, 이미 보낸 공시 0건 건너뜀")
         return
 
     try:
@@ -108,26 +158,37 @@ def main() -> None:
         raise SystemExit(1)
 
     matched = [item for item in result.items if item.stock_code in watchlist]
-    if not matched:
-        print("감시 종목 공시 없음")
-        return
+    to_send = []
+    skipped = 0
+    for item in matched:
+        if item.rcept_no.strip() in sent_ids:
+            skipped += 1
+        else:
+            to_send.append(item)
 
-    received_on = today_yyyymmdd()
-    for index, item in enumerate(matched, start=1):
+    sent_count = 0
+    for index, item in enumerate(to_send, start=1):
+        rcept_no = item.rcept_no.strip()
         text = build_message(
             item.corp_name.strip(),
             item.report_nm.strip(),
-            item.rcept_no.strip(),
+            rcept_no,
             received_on,
         )
         try:
             send_telegram(token, chat_id, text)
         except TelegramError as exc:
+            save_sent(SENT_PATH, sent_rows)
             print(exc)
-            print(f"실패: {index}번째 공시에서 전송을 멈췄습니다.")
+            print(f"실패: {index}번째 새 공시에서 전송을 멈췄습니다.")
+            print(f"새 공시 {sent_count}건 전송, 이미 보낸 공시 {skipped}건 건너뜀")
             raise SystemExit(1)
+        sent_rows.append((rcept_no, format_received_date(received_on)))
+        sent_ids.add(rcept_no)
+        sent_count += 1
+        save_sent(SENT_PATH, sent_rows)
 
-    print(f"{len(matched)}건 전송했습니다")
+    print(f"새 공시 {sent_count}건 전송, 이미 보낸 공시 {skipped}건 건너뜀")
 
 
 if __name__ == "__main__":
