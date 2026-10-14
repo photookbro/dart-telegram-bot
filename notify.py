@@ -18,6 +18,7 @@ from main import ENV_PATH, load_dotenv
 
 WATCHLIST_PATH = Path(__file__).resolve().parent / "watchlist.txt"
 KEYWORDS_PATH = Path(__file__).resolve().parent / "keywords.txt"
+EXCLUDE_PATH = Path(__file__).resolve().parent / "exclude_keywords.txt"
 SENT_PATH = Path(__file__).resolve().parent / "sent_rcept_no.txt"
 TIMEOUT_SECONDS = 15
 KEEP_DAYS = 7
@@ -241,17 +242,27 @@ def title_has_keyword(title: str, keywords: list[str]) -> bool:
     return any(keyword in title for keyword in keywords)
 
 
-def is_selected(notice: Notice, watchlist: set[str], keywords: list[str]) -> bool:
-    """감시 종목은 모든 공시, 코스피·코스닥은 키워드가 있는 공시만."""
+def is_selected(
+    notice: Notice,
+    watchlist: set[str],
+    keywords: list[str],
+    exclude_keywords: list[str],
+) -> bool:
+    """감시 종목은 모든 공시. 코스피·코스닥은 포함 키워드가 있고 제외 키워드가 없을 때만."""
     if notice.stock_code and notice.stock_code in watchlist:
         return True
     if notice.corp_cls not in LISTED_MARKETS or not notice.stock_code:
+        return False
+    if title_has_keyword(notice.report_nm, exclude_keywords):
         return False
     return title_has_keyword(notice.report_nm, keywords)
 
 
 def choose_notices(
-    notices: list[Notice], watchlist: set[str], keywords: list[str]
+    notices: list[Notice],
+    watchlist: set[str],
+    keywords: list[str],
+    exclude_keywords: list[str],
 ) -> list[Notice]:
     """조건에 맞는 공시를 고른다. 같은 접수번호는 한 번만."""
     chosen: list[Notice] = []
@@ -259,11 +270,35 @@ def choose_notices(
     for notice in notices:
         if not notice.rcept_no or notice.rcept_no in seen:
             continue
-        if not is_selected(notice, watchlist, keywords):
+        if not is_selected(notice, watchlist, keywords, exclude_keywords):
             continue
         seen.add(notice.rcept_no)
         chosen.append(notice)
     return chosen
+
+
+def excluded_titles(
+    notices: list[Notice],
+    watchlist: set[str],
+    keywords: list[str],
+    exclude_keywords: list[str],
+) -> list[str]:
+    """포함 키워드가 있지만 제외 키워드 때문에 빠진 제목. 감시 종목은 빼지 않는다."""
+    titles: list[str] = []
+    seen: set[str] = set()
+    for notice in notices:
+        if not notice.rcept_no or notice.rcept_no in seen:
+            continue
+        seen.add(notice.rcept_no)
+        if notice.stock_code and notice.stock_code in watchlist:
+            continue
+        if notice.corp_cls not in LISTED_MARKETS or not notice.stock_code:
+            continue
+        if not title_has_keyword(notice.report_nm, keywords):
+            continue
+        if title_has_keyword(notice.report_nm, exclude_keywords):
+            titles.append(notice.report_nm)
+    return titles
 
 
 def summary_line(sent_count: int, skipped: int, carried: int) -> str:
@@ -310,6 +345,7 @@ def main() -> None:
 
     watchlist = set(load_lines(WATCHLIST_PATH, "watchlist.txt"))
     keywords = load_lines(KEYWORDS_PATH, "keywords.txt")
+    exclude_keywords = load_lines(EXCLUDE_PATH, "exclude_keywords.txt")
 
     try:
         notices = fetch_today_notices(api_key)
@@ -317,7 +353,7 @@ def main() -> None:
         print(exc)
         raise SystemExit(1)
 
-    chosen = choose_notices(notices, watchlist, keywords)
+    chosen = choose_notices(notices, watchlist, keywords, exclude_keywords)
     pending = [notice for notice in chosen if notice.rcept_no not in sent_ids]
     skipped = len(chosen) - len(pending)
 
@@ -332,6 +368,16 @@ def main() -> None:
             f"기준선 기록 {len(pending)}건 "
             f"(코스피 {kospi}건, 코스닥 {kosdaq}건, 그 외 {other}건)"
         )
+        for keyword in keywords:
+            count = sum(1 for notice in pending if keyword in notice.report_nm)
+            print(f"키워드 {keyword}: {count}건")
+        blocked = excluded_titles(notices, watchlist, keywords, exclude_keywords)
+        if blocked:
+            print(f"제외어로 빠진 공시 {len(blocked)}건")
+            for title in blocked:
+                print(f"제외: {title}")
+        else:
+            print("제외어로 빠진 공시 없음")
         print(summary_line(0, skipped, 0))
         return
 
