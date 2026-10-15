@@ -33,6 +33,10 @@ MARKET_NAME = {"Y": "코스피", "K": "코스닥", "N": "코넥스", "E": "기�
 class TelegramError(Exception):
     """사람이 읽을 수 있는 텔레그램 전송 오류. 토큰과 chat_id는 넣지 않는다."""
 
+    def __init__(self, message: str, kind: str = "전송 거절") -> None:
+        super().__init__(message)
+        self.kind = kind
+
 
 @dataclass
 class Notice:
@@ -137,11 +141,13 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
             )
         except requests.Timeout:
             raise TelegramError(
-                "실패: 텔레그램 서버 응답이 15초 안에 오지 않았습니다."
+                "실패: 텔레그램 서버 응답이 15초 안에 오지 않았습니다.",
+                "시간 초과",
             ) from None
         except requests.RequestException:
             raise TelegramError(
-                "실패: 텔레그램 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요."
+                "실패: 텔레그램 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요.",
+                "연결 실패",
             ) from None
 
         try:
@@ -149,7 +155,8 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         except ValueError:
             raise TelegramError(
                 "실패: 텔레그램 응답을 해석하지 못했습니다.\n"
-                f"HTTP 상태 코드: {response.status_code}"
+                f"HTTP 상태 코드: {response.status_code}",
+                "응답 해석 실패",
             ) from None
 
         too_many = response.status_code == 429 or (
@@ -159,7 +166,8 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
             if attempt == MAX_429_ATTEMPTS:
                 raise TelegramError(
                     "실패: 텔레그램이 요청이 너무 많다고 거절했습니다. "
-                    "이 공시는 기록하지 않고 다음 실행에서 다시 시도합니다."
+                    "이 공시는 기록하지 않고 다음 실행에서 다시 시도합니다.",
+                    "요청 과다",
                 )
             time.sleep(_retry_after_seconds(body))
             continue
@@ -170,10 +178,17 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         description = "알 수 없는 오류"
         if isinstance(body, dict):
             description = str(body.get("description") or description)
+        if response.status_code == 403:
+            kind = "권한 오류"
+        elif response.status_code == 400:
+            kind = "대화를 찾지 못함"
+        else:
+            kind = "전송 거절"
         raise TelegramError(
             "실패: 텔레그램이 메시지 전송을 거절했습니다.\n"
             f"HTTP 상태 코드: {response.status_code}\n"
-            f"상세: {description}"
+            f"상세: {description}",
+            kind,
         )
 
 
@@ -301,8 +316,19 @@ def excluded_titles(
     return titles
 
 
-def summary_line(sent_count: int, skipped: int, carried: int) -> str:
-    return f"새 공시 {sent_count}건 전송, 이미 보낸 공시 {skipped}건 건너뜀, 이월 {carried}건"
+def summary_line(
+    sent_count: int,
+    direct_count: int,
+    channel_ok: int,
+    channel_fail: int,
+    skipped: int,
+    carried: int,
+) -> str:
+    return (
+        f"새 공시 {sent_count}건 전송"
+        f"(1:1 {direct_count}건, 채널 {channel_ok}건, 채널 실패 {channel_fail}건), "
+        f"이미 보낸 공시 {skipped}건 건너뜀, 이월 {carried}건"
+    )
 
 
 def remember(sent_rows: list[tuple[str, str]], sent_ids: set[str], notice: Notice) -> None:
@@ -378,29 +404,45 @@ def main() -> None:
                 print(f"제외: {title}")
         else:
             print("제외어로 빠진 공시 없음")
-        print(summary_line(0, skipped, 0))
+        print(summary_line(0, 0, 0, 0, skipped, 0))
         return
 
+    channel_id = os.environ.get("TELEGRAM_CHANNEL_ID", "").strip()
     send_now = pending[:MAX_SENDS]
     carried = pending[MAX_SENDS:]
     sent_count = 0
+    direct_count = 0
+    channel_ok = 0
+    channel_fail = 0
     for index, notice in enumerate(send_now, start=1):
         if index > 1:
             time.sleep(SEND_GAP_SECONDS)
+        text = build_message(notice)
         try:
-            send_telegram(token, chat_id, build_message(notice))
+            send_telegram(token, chat_id, text)
         except TelegramError as exc:
             save_sent(SENT_PATH, sent_rows)
             left = (len(send_now) - sent_count) + len(carried)
             print(exc)
             print(f"실패: {index}번째 새 공시에서 전송을 멈췄습니다.")
-            print(summary_line(sent_count, skipped, left))
+            print(summary_line(sent_count, direct_count, channel_ok, channel_fail, skipped, left))
             raise SystemExit(1)
         remember(sent_rows, sent_ids, notice)
         sent_count += 1
+        direct_count += 1
         save_sent(SENT_PATH, sent_rows)
+        if not channel_id:
+            continue
+        time.sleep(SEND_GAP_SECONDS)
+        try:
+            send_telegram(token, channel_id, text)
+        except TelegramError as exc:
+            channel_fail += 1
+            print(f"채널 실패: {notice.rcept_no} {exc.kind}")
+            continue
+        channel_ok += 1
 
-    print(summary_line(sent_count, skipped, len(carried)))
+    print(summary_line(sent_count, direct_count, channel_ok, channel_fail, skipped, len(carried)))
 
 
 if __name__ == "__main__":
