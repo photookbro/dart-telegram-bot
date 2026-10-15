@@ -75,11 +75,7 @@ def build_message(notice: Notice) -> str:
     """텔레그램에 보낼 공시 한 건 문구를 만든다."""
     market = MARKET_NAME.get(notice.corp_cls, "기타")
     link = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={notice.rcept_no}"
-    return (
-        f"[{market}] {notice.corp_name} / {notice.report_nm}\n"
-        f"접수일: {format_received_date(notice.rcept_dt)}\n"
-        f"원문: {link}"
-    )
+    return f"[{market}] {notice.corp_name} / {notice.report_nm}\n원문: {link}"
 
 
 def load_sent(path: Path, today: date) -> list[tuple[str, str]]:
